@@ -111,10 +111,18 @@ export class DirectoryArtifactReader implements ArtifactReader {
           cause,
         );
       });
+      // On Windows, lstat does not open a handle and reports dev as 0,
+      // while handle.stat() populates the volume serial number.
+      const matchesDevice = (
+        identity: NonNullable<ArtifactEntry["sourceIdentity"]>,
+      ): boolean =>
+        process.platform === "win32" ||
+        identity.device === 0 ||
+        observed.dev === identity.device;
       if (
         !observed.isFile() ||
         entry.sourceIdentity === undefined ||
-        observed.dev !== entry.sourceIdentity.device ||
+        !matchesDevice(entry.sourceIdentity) ||
         observed.ino !== entry.sourceIdentity.inode
       ) {
         throw new ArtifactReaderFailure(
