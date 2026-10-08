@@ -1,65 +1,73 @@
-import { writeFile } from "node:fs/promises";
+import { lstat, open, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { buffer } from "node:stream/consumers";
 
 import { describe, expect, it } from "vitest";
 
-import {
-  ArtifactReaderFailure,
-  type ArtifactEntry,
-} from "../../../src/artifacts/ArtifactReader.js";
+import { type ArtifactEntry } from "../../../src/artifacts/ArtifactReader.js";
 import { DirectoryArtifactReader } from "../../../src/artifacts/DirectoryArtifactReader.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
-describe("DirectoryArtifactReader.open", () => {
-  it("opens regular files from directory reader and reads their contents", async () => {
-    const root = await createTestTempDirectory("rea-dir-reader-open-");
-    const filePath = join(root, "sample.txt");
-    await writeFile(filePath, "test payload\n");
-    const reader = new DirectoryArtifactReader(root);
-    try {
-      const entries: ArtifactEntry[] = [];
-      for await (const entry of reader.entries()) {
-        entries.push(entry);
-      }
-      const sampleEntry = entries.find((e) => e.path === "sample.txt");
-      expect(sampleEntry).toBeDefined();
-      expect(sampleEntry?.kind).toBe("file");
-      expect(sampleEntry?.sourceIdentity).toBeDefined();
+const sampleEntry = async (
+  reader: DirectoryArtifactReader,
+): Promise<ArtifactEntry> => {
+  for await (const entry of reader.entries()) {
+    if (entry.path === "sample.txt") return entry;
+  }
+  throw new Error("Fixture omitted sample.txt");
+};
 
-      const stream = await reader.open(sampleEntry!);
-      const content = (await buffer(stream)).toString("utf8");
-      expect(content).toBe("test payload\n");
+const fixture = async () => {
+  const root = await createTestTempDirectory("rea-dir-reader-open-");
+  const path = join(root, "sample.txt");
+  await writeFile(path, "test payload\n");
+  return { path, reader: new DirectoryArtifactReader(root) };
+};
+
+describe("DirectoryArtifactReader.open", () => {
+  it("preserves native path and handle identity while streaming an unchanged file", async () => {
+    const { path, reader } = await fixture();
+    try {
+      const entry = await sampleEntry(reader);
+      const metadata = await lstat(path);
+      const handle = await open(path, "r");
+      try {
+        const observed = await handle.stat();
+        expect(entry.sourceIdentity).toEqual({
+          device: metadata.dev,
+          inode: metadata.ino,
+        });
+        expect({ device: observed.dev, inode: observed.ino }).toEqual(
+          entry.sourceIdentity,
+        );
+        console.info(
+          JSON.stringify({
+            platform: process.platform,
+            node: process.version,
+            pathDevice: metadata.dev,
+            handleDevice: observed.dev,
+            pathInode: metadata.ino,
+            handleInode: observed.ino,
+          }),
+        );
+      } finally {
+        await handle.close();
+      }
+      expect((await buffer(await reader.open(entry))).toString("utf8")).toBe(
+        "test payload\n",
+      );
     } finally {
       await reader.close();
     }
   });
 
-  it("rejects open if inode does not match", async () => {
-    const root = await createTestTempDirectory("rea-dir-reader-open-");
-    const filePath = join(root, "sample.txt");
-    await writeFile(filePath, "test payload\n");
-    const reader = new DirectoryArtifactReader(root);
+  it("rejects an actual file replacement after enumeration", async () => {
+    const { path, reader } = await fixture();
     try {
-      const entries: ArtifactEntry[] = [];
-      for await (const entry of reader.entries()) {
-        entries.push(entry);
-      }
-      const sampleEntry = entries.find((e) => e.path === "sample.txt");
-      expect(sampleEntry).toBeDefined();
-
-      const tamperedEntry: ArtifactEntry = {
-        ...sampleEntry!,
-        sourceIdentity: {
-          device: sampleEntry!.sourceIdentity!.device,
-          inode: sampleEntry!.sourceIdentity!.inode + 999999,
-        },
-      };
-
-      await expect(reader.open(tamperedEntry)).rejects.toThrow(
-        ArtifactReaderFailure,
-      );
-      await expect(reader.open(tamperedEntry)).rejects.toMatchObject({
+      const entry = await sampleEntry(reader);
+      await rename(path, `${path}.original`);
+      await writeFile(path, "replacement payload\n");
+      await expect(reader.open(entry)).rejects.toMatchObject({
         reason: "integrity",
       });
     } finally {
@@ -67,60 +75,50 @@ describe("DirectoryArtifactReader.open", () => {
     }
   });
 
-  it("allows open when entry device is 0 and inode matches", async () => {
-    const root = await createTestTempDirectory("rea-dir-reader-open-");
-    const filePath = join(root, "sample.txt");
-    await writeFile(filePath, "windows lstat compatibility\n");
-    const reader = new DirectoryArtifactReader(root);
-    try {
-      let fileEntry: ArtifactEntry | undefined;
-      for await (const entry of reader.entries()) {
-        if (entry.path === "sample.txt") fileEntry = entry;
+  it.each(["zero", "another"] as const)(
+    "requires the enumerated %s device to match the opened file",
+    async (kind) => {
+      const { reader } = await fixture();
+      try {
+        const entry = await sampleEntry(reader);
+        const identity = entry.sourceIdentity;
+        if (identity === undefined)
+          throw new Error("Fixture omitted source identity");
+        if (kind === "zero" && identity.device === 0) {
+          expect(
+            (await buffer(await reader.open(entry))).toString("utf8"),
+          ).toBe("test payload\n");
+          return;
+        }
+        const device = kind === "zero" ? 0 : identity.device === 1 ? 2 : 1;
+        await expect(
+          reader.open({ ...entry, sourceIdentity: { ...identity, device } }),
+        ).rejects.toMatchObject({ reason: "integrity" });
+      } finally {
+        await reader.close();
       }
-      expect(fileEntry).toBeDefined();
+    },
+  );
 
-      // On Windows, lstat reports dev as 0 while handle.stat() reports volume serial number.
-      // Simulating device = 0 verifies this does not trigger a false-positive integrity failure.
-      const entryWithZeroDev: ArtifactEntry = {
-        ...fileEntry!,
-        sourceIdentity: {
-          device: 0,
-          inode: fileEntry!.sourceIdentity!.inode,
-        },
-      };
-
-      const stream = await reader.open(entryWithZeroDev);
-      const content = (await buffer(stream)).toString("utf8");
-      expect(content).toBe("windows lstat compatibility\n");
+  it("rejects a file without enumerated source identity", async () => {
+    const { reader } = await fixture();
+    try {
+      const { sourceIdentity: _identity, ...entry } = await sampleEntry(reader);
+      await expect(reader.open(entry)).rejects.toMatchObject({
+        reason: "integrity",
+      });
     } finally {
       await reader.close();
     }
   });
 
-  it("rejects open if entry kind is not file", async () => {
-    const root = await createTestTempDirectory("rea-dir-reader-open-");
-    const reader = new DirectoryArtifactReader(root);
+  it("rejects entries that are not files", async () => {
+    const { reader } = await fixture();
     try {
-      const nonFileEntry: ArtifactEntry = {
-        path: "some-dir",
-        kind: "directory",
-        declaredSize: null,
-        compressedSize: null,
-        executable: false,
-        encrypted: false,
-        byteOffset: null,
-        declaredSha256: null,
-        unpacked: false,
-        limitations: [],
-        adapterKey: root,
-      };
-
-      await expect(reader.open(nonFileEntry)).rejects.toThrow(
-        ArtifactReaderFailure,
-      );
-      await expect(reader.open(nonFileEntry)).rejects.toMatchObject({
-        reason: "format",
-      });
+      const entry = await sampleEntry(reader);
+      await expect(
+        reader.open({ ...entry, kind: "directory" }),
+      ).rejects.toMatchObject({ reason: "format" });
     } finally {
       await reader.close();
     }
